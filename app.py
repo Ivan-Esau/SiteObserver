@@ -8,6 +8,7 @@ import streamlit as st
 from state import SharedState, Condition, COLORS
 from scraper import run_scraper
 import notifier
+import auth
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -40,6 +41,44 @@ state = get_shared_state()
 start_scraper(state)
 
 
+# ── Auth helpers ─────────────────────────────────────────────────────────────
+
+def _show_auth_form() -> None:
+    """Render login/signup forms in the sidebar."""
+    tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
+
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login")
+            if submitted:
+                ok, msg = auth.login(email, password)
+                if ok:
+                    st.session_state["user_email"] = email.strip().lower()
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    with tab_signup:
+        with st.form("signup_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            password2 = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Sign Up")
+            if submitted:
+                if password != password2:
+                    st.error("Passwords do not match")
+                else:
+                    ok, msg = auth.signup(email, password)
+                    if ok:
+                        st.session_state["user_email"] = email.strip().lower()
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -47,28 +86,40 @@ with st.sidebar:
 
     # Scraper status
     scraper_status, scraper_error = state.get_scraper_status()
-    status_colors = {
+    status_icons = {
         "running": "🟢", "starting": "🟡",
         "stopped": "🔴", "error": "🔴",
     }
-    st.markdown(f"**Scraper:** {status_colors.get(scraper_status, '⚪')} {scraper_status}")
+    st.markdown(f"**Scraper:** {status_icons.get(scraper_status, '⚪')} {scraper_status}")
     if scraper_error:
         st.caption(f"Error: {scraper_error[:100]}")
 
     st.divider()
 
-    # Email config
-    st.subheader("Email notifications")
-    if notifier.is_configured():
-        st.caption("Resend API key: configured")
-    else:
-        st.warning("Set RESEND_API_KEY in .env or Streamlit secrets")
+    # Auth section
+    user_email = st.session_state.get("user_email")
 
-    current_email = state.get_email()
-    new_email = st.text_input("Notification email", value=current_email)
-    if new_email != current_email:
-        state.set_email(new_email)
-        st.success("Email saved")
+    if user_email:
+        st.markdown(f"**Logged in as:** {user_email}")
+
+        # Discord ID management
+        current_discord_id = auth.get_discord_id(user_email) or ""
+        discord_input = st.text_input(
+            "Discord User ID",
+            value=current_discord_id,
+            help="Right-click your profile in Discord > Copy User ID",
+        )
+        if discord_input != current_discord_id:
+            if st.button("Save Discord ID"):
+                auth.set_discord_id(user_email, discord_input)
+                st.success("Discord ID saved")
+                st.rerun()
+
+        if st.button("Logout"):
+            del st.session_state["user_email"]
+            st.rerun()
+    else:
+        _show_auth_form()
 
     st.divider()
 
@@ -78,9 +129,11 @@ with st.sidebar:
 
 # ── Main area ────────────────────────────────────────────────────────────────
 
-tab_rolls, tab_conditions, tab_alerts = st.tabs(["Live Rolls", "Alert Conditions", "Alert Log"])
+tab_rolls, tab_conditions, tab_alerts = st.tabs(
+    ["Live Rolls", "Alert Conditions", "Alert Log"]
+)
 
-# ── Tab 1: Live rolls ───────────────────────────────────────────────────────
+# ── Tab 1: Live rolls (visible to everyone) ──────────────────────────────────
 
 with tab_rolls:
     rolls = state.get_rolls(100)
@@ -88,7 +141,6 @@ with tab_rolls:
     if not rolls:
         st.info("Waiting for scraper to connect and receive rolls...")
     else:
-        # Distribution bar
         ct = sum(1 for r in rolls if r.coin == "ct")
         t = sum(1 for r in rolls if r.coin == "t")
         bonus = sum(1 for r in rolls if r.coin == "bonus")
@@ -100,9 +152,9 @@ with tab_rolls:
         col3.metric("Orange (T)", t)
         col4.metric("Green (Bonus)", bonus)
 
-        # Color-coded roll display (most recent first)
-        st.subheader("Recent rolls")
-        display_rolls = list(reversed(rolls[-50:]))
+        # All 100 rolls, most recent first
+        st.subheader("Last 100 rolls")
+        display_rolls = list(reversed(rolls[-100:]))
         dots = ""
         for r in display_rolls:
             color = COLOR_HEX.get(r.coin, "#888")
@@ -120,78 +172,110 @@ with tab_rolls:
             f"Last updated: {rolls[-1].timestamp[:19]}"
         )
 
-# ── Tab 2: Alert conditions ─────────────────────────────────────────────────
+# ── Tab 2: Alert conditions (requires login) ────────────────────────────────
 
 with tab_conditions:
-    st.subheader("Add new condition")
+    user_email = st.session_state.get("user_email")
 
-    with st.form("add_condition", clear_on_submit=True):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            color_label = st.selectbox("Color", list(COLOR_OPTIONS.keys()))
-            cond_type_label = st.selectbox("Condition type", list(CONDITION_TYPES.keys()))
-        with col_b:
-            cond_type = CONDITION_TYPES[cond_type_label]
-            if cond_type == "count_below":
-                param_n = st.number_input("In last N rolls", min_value=10, max_value=100, value=100)
-                param_threshold = st.number_input("Below count", min_value=1, max_value=100, value=5)
-            elif cond_type == "absent_streak":
-                param_n = st.number_input("Absent for N rolls", min_value=5, max_value=100, value=20)
-                param_threshold = 0
-            else:
-                param_n = st.number_input("Consecutive count", min_value=2, max_value=50, value=5)
-                param_threshold = 0
-            cooldown = st.number_input("Cooldown (minutes)", min_value=1, max_value=120, value=10)
-
-        submitted = st.form_submit_button("Add condition")
-        if submitted:
-            condition = Condition(
-                color=COLOR_OPTIONS[color_label],
-                type=cond_type,
-                param_n=param_n,
-                param_threshold=param_threshold,
-                cooldown_minutes=cooldown,
-            )
-            state.add_condition(condition)
-            st.success(f"Added: {condition.description}")
-            st.rerun()
-
-    # List active conditions
-    st.subheader("Active conditions")
-    active_conditions = state.get_conditions()
-    if not active_conditions:
-        st.info("No conditions configured yet.")
+    if not user_email:
+        st.warning("Please log in to configure alert conditions.")
     else:
-        for c in active_conditions:
-            col_desc, col_status, col_del = st.columns([4, 2, 1])
-            color_hex = COLOR_HEX.get(c.color, "#888")
-            col_desc.markdown(
-                f'<span style="color:{color_hex};font-weight:bold;">'
-                f"{c.description}</span>",
-                unsafe_allow_html=True,
-            )
-            if c.last_fired_at:
-                col_status.caption(f"Last fired: {c.last_fired_at[:19]}")
-            else:
-                col_status.caption("Never fired")
-            if col_del.button("Delete", key=f"del_{c.id}"):
-                state.remove_condition(c.id)
+        st.subheader("Add new condition")
+
+        discord_id = auth.get_discord_id(user_email)
+        if discord_id:
+            st.caption(f"Alerts will be sent via Discord DM to user `{discord_id}`")
+        else:
+            st.warning("Set your Discord User ID in the sidebar to receive alerts.")
+
+        if not notifier.is_configured():
+            st.warning("DISCORD_BOT_TOKEN not set — DMs won't be sent.")
+
+        with st.form("add_condition", clear_on_submit=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                color_label = st.selectbox("Color", list(COLOR_OPTIONS.keys()))
+                cond_type_label = st.selectbox(
+                    "Condition type", list(CONDITION_TYPES.keys())
+                )
+            with col_b:
+                cond_type = CONDITION_TYPES[cond_type_label]
+                if cond_type == "count_below":
+                    param_n = st.number_input(
+                        "In last N rolls", min_value=10, max_value=100, value=100
+                    )
+                    param_threshold = st.number_input(
+                        "Below count", min_value=1, max_value=100, value=5
+                    )
+                elif cond_type == "absent_streak":
+                    param_n = st.number_input(
+                        "Absent for N rolls", min_value=5, max_value=100, value=20
+                    )
+                    param_threshold = 0
+                else:
+                    param_n = st.number_input(
+                        "Consecutive count", min_value=2, max_value=50, value=5
+                    )
+                    param_threshold = 0
+                cooldown = st.number_input(
+                    "Cooldown (minutes)", min_value=1, max_value=120, value=10
+                )
+
+            submitted = st.form_submit_button("Add condition")
+            if submitted:
+                condition = Condition(
+                    color=COLOR_OPTIONS[color_label],
+                    type=cond_type,
+                    param_n=param_n,
+                    param_threshold=param_threshold,
+                    cooldown_minutes=cooldown,
+                    user_email=user_email,
+                )
+                state.add_condition(condition)
+                st.success(f"Added: {condition.description}")
                 st.rerun()
 
-# ── Tab 3: Alert log ────────────────────────────────────────────────────────
+        # List user's active conditions
+        st.subheader("Your active conditions")
+        user_conditions = state.get_conditions(user_email)
+        if not user_conditions:
+            st.info("No conditions configured yet.")
+        else:
+            for c in user_conditions:
+                col_desc, col_status, col_del = st.columns([4, 2, 1])
+                color_hex = COLOR_HEX.get(c.color, "#888")
+                col_desc.markdown(
+                    f'<span style="color:{color_hex};font-weight:bold;">'
+                    f"{c.description}</span>",
+                    unsafe_allow_html=True,
+                )
+                if c.last_fired_at:
+                    col_status.caption(f"Last fired: {c.last_fired_at[:19]}")
+                else:
+                    col_status.caption("Never fired")
+                if col_del.button("Delete", key=f"del_{c.id}"):
+                    state.remove_condition(c.id, user_email)
+                    st.rerun()
+
+# ── Tab 3: Alert log (per-user) ─────────────────────────────────────────────
 
 with tab_alerts:
-    alerts = state.get_alerts(50)
-    if not alerts:
-        st.info("No alerts fired yet.")
+    user_email = st.session_state.get("user_email")
+
+    if not user_email:
+        st.warning("Please log in to view your alert history.")
     else:
-        for alert in reversed(alerts):
-            icon = "✅" if alert.email_sent else "⚠️"
-            st.markdown(
-                f"**{icon} {alert.fired_at[:19]}** — {alert.condition_desc}"
-            )
-            if alert.error:
-                st.caption(f"Error: {alert.error}")
+        alerts = state.get_alerts(user_email, n=50)
+        if not alerts:
+            st.info("No alerts fired yet.")
+        else:
+            for alert in reversed(alerts):
+                icon = "✅" if alert.email_sent else "⚠️"
+                st.markdown(
+                    f"**{icon} {alert.fired_at[:19]}** — {alert.condition_desc}"
+                )
+                if alert.error:
+                    st.caption(f"Error: {alert.error}")
 
 # ── Auto-refresh ─────────────────────────────────────────────────────────────
 

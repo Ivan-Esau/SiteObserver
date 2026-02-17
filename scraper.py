@@ -6,6 +6,7 @@ import subprocess
 
 from playwright.async_api import async_playwright, Page, Browser
 
+import auth
 import conditions as cond_engine
 import notifier
 from state import SharedState, Roll, Alert
@@ -79,9 +80,8 @@ async def _poll_once(page: Page, state: SharedState) -> None:
 
 def _evaluate_conditions(state: SharedState) -> None:
     rolls = state.get_rolls(100)
-    email = state.get_email()
 
-    for condition in state.get_conditions():
+    for condition in state.get_all_conditions():
         if not condition.enabled:
             continue
         if cond_engine.is_in_cooldown(condition):
@@ -89,16 +89,20 @@ def _evaluate_conditions(state: SharedState) -> None:
         if not cond_engine.evaluate(condition, rolls):
             continue
 
-        logger.info("Condition triggered: %s", condition.description)
+        logger.info("Condition triggered: %s (user: %s)", condition.description, condition.user_email)
 
-        success, error = False, "No email configured"
-        if email and notifier.is_configured():
-            success, error = notifier.send_alert(email, condition, rolls)
+        success, error = False, "No Discord ID configured"
+        discord_id = auth.get_discord_id(condition.user_email) if condition.user_email else None
+        if discord_id and notifier.is_configured():
+            success, error = notifier.send_alert(discord_id, condition, rolls)
+        elif not discord_id:
+            logger.warning("No Discord ID for user %s, skipping notification", condition.user_email)
 
         state.update_condition_fired(condition.id)
         state.add_alert(Alert(
             condition_id=condition.id,
             condition_desc=condition.description,
+            user_email=condition.user_email,
             email_sent=success,
             error=error,
         ))

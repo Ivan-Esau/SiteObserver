@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -40,6 +40,7 @@ class Condition:
     cooldown_minutes: int = 10
     last_fired_at: str = ""
     enabled: bool = True
+    user_email: str = ""     # owner of this condition
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -62,6 +63,7 @@ class Alert:
     id: str = ""
     condition_id: str = ""
     condition_desc: str = ""
+    user_email: str = ""
     fired_at: str = ""
     email_sent: bool = False
     error: str = ""
@@ -94,7 +96,6 @@ class SharedState:
         self.alerts: list[Alert] = []
         self.scraper_status: str = "stopped"
         self.scraper_error: str = ""
-        self.email: str = ""
         self._load()
 
     def _load(self) -> None:
@@ -102,7 +103,6 @@ class SharedState:
             return
         try:
             data = json.loads(PERSIST_FILE.read_text(encoding="utf-8"))
-            self.email = data.get("email", "")
             self.conditions = [
                 Condition(**c) for c in data.get("conditions", [])
             ]
@@ -113,7 +113,6 @@ class SharedState:
     def _save(self) -> None:
         try:
             data = {
-                "email": self.email,
                 "conditions": [asdict(c) for c in self.conditions],
             }
             PERSIST_FILE.write_text(
@@ -122,8 +121,9 @@ class SharedState:
         except Exception:
             logger.exception("Failed to save state")
 
+    # ── Rolls (global, shared across all users) ──────────────────────────
+
     def add_rolls(self, new_rolls: list[Roll]) -> list[Roll]:
-        """Add new rolls, update last_index. Returns only the truly new ones."""
         with self._data_lock:
             added = []
             for roll in new_rolls:
@@ -131,7 +131,6 @@ class SharedState:
                     self.rolls.append(roll)
                     self.last_index = roll.index
                     added.append(roll)
-            # Keep only last 200 rolls in memory
             if len(self.rolls) > 200:
                 self.rolls = self.rolls[-200:]
             return added
@@ -140,28 +139,28 @@ class SharedState:
         with self._data_lock:
             return list(self.rolls[-n:])
 
-    def set_email(self, email: str) -> None:
-        with self._data_lock:
-            self.email = email
-            self._save()
-
-    def get_email(self) -> str:
-        with self._data_lock:
-            return self.email
+    # ── Conditions (per-user) ────────────────────────────────────────────
 
     def add_condition(self, condition: Condition) -> None:
         with self._data_lock:
             self.conditions.append(condition)
             self._save()
 
-    def remove_condition(self, condition_id: str) -> None:
+    def remove_condition(self, condition_id: str, user_email: str) -> None:
         with self._data_lock:
             self.conditions = [
-                c for c in self.conditions if c.id != condition_id
+                c for c in self.conditions
+                if not (c.id == condition_id and c.user_email == user_email)
             ]
             self._save()
 
-    def get_conditions(self) -> list[Condition]:
+    def get_conditions(self, user_email: str | None = None) -> list[Condition]:
+        with self._data_lock:
+            if user_email is None:
+                return list(self.conditions)
+            return [c for c in self.conditions if c.user_email == user_email]
+
+    def get_all_conditions(self) -> list[Condition]:
         with self._data_lock:
             return list(self.conditions)
 
@@ -173,16 +172,22 @@ class SharedState:
                     break
             self._save()
 
+    # ── Alerts (per-user) ────────────────────────────────────────────────
+
     def add_alert(self, alert: Alert) -> None:
         with self._data_lock:
             self.alerts.append(alert)
-            # Keep last 100 alerts
-            if len(self.alerts) > 100:
-                self.alerts = self.alerts[-100:]
+            if len(self.alerts) > 500:
+                self.alerts = self.alerts[-500:]
 
-    def get_alerts(self, n: int = 50) -> list[Alert]:
+    def get_alerts(self, user_email: str | None = None, n: int = 50) -> list[Alert]:
         with self._data_lock:
-            return list(self.alerts[-n:])
+            if user_email is None:
+                return list(self.alerts[-n:])
+            user_alerts = [a for a in self.alerts if a.user_email == user_email]
+            return user_alerts[-n:]
+
+    # ── Scraper status ───────────────────────────────────────────────────
 
     def set_scraper_status(self, status: str, error: str = "") -> None:
         with self._data_lock:

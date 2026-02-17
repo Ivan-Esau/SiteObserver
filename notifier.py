@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 
-import resend
+import requests
 from dotenv import load_dotenv
 
 from state import Condition, Roll, COLORS
@@ -12,87 +13,94 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+DISCORD_API = "https://discord.com/api/v10"
 
-def _get_api_key() -> str:
-    """Read API key from env var (.env) or Streamlit secrets (cloud)."""
-    key = os.getenv("RESEND_API_KEY", "")
-    if not key:
+
+def _get_bot_token() -> str:
+    """Read bot token from env var (.env) or Streamlit secrets (cloud)."""
+    token = os.getenv("DISCORD_BOT_TOKEN", "")
+    if not token:
         try:
             import streamlit as st
-            key = st.secrets.get("RESEND_API_KEY", "")
+            token = st.secrets.get("DISCORD_BOT_TOKEN", "")
         except Exception:
             pass
-    return key
+    return token
 
 
-_api_key: str = _get_api_key()
+_bot_token: str = _get_bot_token()
 
 
 def is_configured() -> bool:
-    return bool(_api_key) and _api_key != "your_key_here"
+    return bool(_bot_token) and _bot_token != "your_bot_token_here"
+
+
+def _build_message(condition: Condition, rolls: list[Roll]) -> str:
+    last_100 = rolls[-100:]
+    ct = sum(1 for r in last_100 if r.coin == "ct")
+    t = sum(1 for r in last_100 if r.coin == "t")
+    bonus = sum(1 for r in last_100 if r.coin == "bonus")
+    now = datetime.now().isoformat(timespec="seconds")
+
+    return (
+        f"**SiteObserver Alert**\n\n"
+        f"Condition triggered: **{condition.description}**\n\n"
+        f"Last {len(last_100)} rolls:\n"
+        f"  Black (CT): **{ct}**\n"
+        f"  Orange (T): **{t}**\n"
+        f"  Green (Bonus): **{bonus}**\n\n"
+        f"Time: {now}\n"
+        f"Cooldown: {condition.cooldown_minutes} min"
+    )
 
 
 def send_alert(
-    to_email: str,
+    discord_user_id: str,
     condition: Condition,
     rolls: list[Roll],
 ) -> tuple[bool, str]:
-    """Send an alert email. Returns (success, error_message)."""
+    """Send a Discord DM alert. Returns (success, error_message)."""
     if not is_configured():
-        return False, "RESEND_API_KEY not configured"
+        return False, "DISCORD_BOT_TOKEN not configured"
 
-    if not to_email:
-        return False, "No recipient email set"
+    if not discord_user_id:
+        return False, "No Discord user ID set"
 
-    resend.api_key = _api_key
+    headers = {
+        "Authorization": f"Bot {_bot_token}",
+        "Content-Type": "application/json",
+    }
 
-    last_100 = rolls[-100:]
-    ct_count = sum(1 for r in last_100 if r.coin == "ct")
-    t_count = sum(1 for r in last_100 if r.coin == "t")
-    bonus_count = sum(1 for r in last_100 if r.coin == "bonus")
-
-    subject = f"SiteObserver Alert: {condition.description}"
-
-    html_body = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto;">
-        <h2 style="color: #e74c3c;">Alert Triggered</h2>
-        <p style="font-size: 16px;"><strong>{condition.description}</strong></p>
-
-        <h3>Current Distribution (last {len(last_100)} rolls)</h3>
-        <table style="border-collapse: collapse; width: 100%;">
-            <tr>
-                <td style="padding: 8px; background: #2c3e50; color: white;">
-                    Black (CT): <strong>{ct_count}</strong>
-                </td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; background: #27ae60; color: white;">
-                    Green (Bonus): <strong>{bonus_count}</strong>
-                </td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; background: #e67e22; color: white;">
-                    Orange (T): <strong>{t_count}</strong>
-                </td>
-            </tr>
-        </table>
-
-        <p style="color: #888; font-size: 12px; margin-top: 20px;">
-            Cooldown: {condition.cooldown_minutes} min before next alert for this condition.
-        </p>
-    </div>
-    """
-
+    # Step 1: Open DM channel
     try:
-        resend.Emails.send({
-            "from": "SiteObserver <onboarding@resend.dev>",
-            "to": [to_email],
-            "subject": subject,
-            "html": html_body,
-        })
-        logger.info("Alert email sent to %s: %s", to_email, condition.description)
+        resp = requests.post(
+            f"{DISCORD_API}/users/@me/channels",
+            json={"recipient_id": discord_user_id},
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        channel_id = resp.json()["id"]
+    except requests.RequestException as exc:
+        error = f"Failed to open DM channel: {exc}"
+        logger.error(error)
+        return False, error
+
+    # Step 2: Send message
+    message = _build_message(condition, rolls)
+    try:
+        resp = requests.post(
+            f"{DISCORD_API}/channels/{channel_id}/messages",
+            json={"content": message},
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        logger.info(
+            "Discord DM sent to %s: %s", discord_user_id, condition.description
+        )
         return True, ""
-    except Exception as exc:
-        error = str(exc)
-        logger.exception("Failed to send alert email")
+    except requests.RequestException as exc:
+        error = f"Failed to send DM: {exc}"
+        logger.error(error)
         return False, error
